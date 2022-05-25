@@ -1,8 +1,20 @@
 import kotlinx.coroutines.*
+import java.net.MalformedURLException
 import java.net.URL
-import java.util.Timer
 
-
+fun extractUrls(body: String) {
+    Regex("<a.*href=\"(.+?\")")
+        .findAll(body)
+        .map { it.groups[1]?.value.toString() }
+        .filter {
+            try {
+                URL(it)
+                true
+            } catch (e: MalformedURLException) {
+                false
+            }
+        }.toList()
+}
 suspend fun dosome() = coroutineScope {
     var dispatcher = Dispatchers.IO.limitedParallelism(30)
     val result = (1..30).map {
@@ -13,18 +25,15 @@ suspend fun dosome() = coroutineScope {
 
     } .map {
         it.await()
-    }.joinToString("\n") {
-        it.substring(0, 10)
-    }
+    }.joinToString("\n")
 
     println(result)
 }
 
 fun main(args: Array<String>) = runBlocking {
-    val start = System.currentTimeMillis()
-    dosome()
-    val finish = System.currentTimeMillis()
+//    val start = System.currentTimeMillis()
+//    dosome()
+//    val finish = System.currentTimeMillis()
 
-
-    println(finish - start)
+//    println(finish - start)
 }
