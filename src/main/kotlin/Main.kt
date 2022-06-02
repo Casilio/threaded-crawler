@@ -1,13 +1,17 @@
 import kotlinx.coroutines.*
+import java.io.FileReader
 import java.net.MalformedURLException
 import java.net.URL
+import java.util.*
+import kotlin.collections.ArrayList
+import kotlin.collections.HashMap
 import kotlin.system.exitProcess
 
 class Parser(var url: String, val body: String, val listTerms: List<String>) {
     var current = 0
     var start = 0
     var isCollecting = false
-    val links: ArrayList<String> = ArrayList<String>()
+    val links: ArrayList<String> = ArrayList()
     var terms: HashMap<String, Int>
     var domain: String
 
@@ -18,7 +22,6 @@ class Parser(var url: String, val body: String, val listTerms: List<String>) {
     }
 
     fun parse() {
-        // TODO: skip comments
         while (!isAtEnd()) {
             skipWhiteSpace()
 
@@ -27,6 +30,8 @@ class Parser(var url: String, val body: String, val listTerms: List<String>) {
             if (c == '<') {
                 advance()
                 parseTag()
+            } else {
+                advance()
             }
         }
     }
@@ -36,14 +41,18 @@ class Parser(var url: String, val body: String, val listTerms: List<String>) {
     }
 
     private fun isAtEnd(): Boolean {
-        return body.length == current
+        return current >= body.length - 1
     }
 
     private fun skipWhiteSpace() {
         while (!isAtEnd()) {
             val c = body[current]
 
-            if (c == '\n' || c == ' ' || c == '\t') advance() else break
+            if (c == '\n' || c == ' ' || c == '\t') {
+                advance()
+            } else {
+                break
+            }
         }
 
         start = current
@@ -52,6 +61,15 @@ class Parser(var url: String, val body: String, val listTerms: List<String>) {
     private fun parseTag() {
         skipWhiteSpace()
         if (check('!')) consume('!')
+        if (peek(0) == '-' && peek(1) == '-') {
+            while (!isAtEnd() && body[current] != '-' && peek(1) != '-' && peek(2) != '>') {
+                advance()
+            }
+
+            repeat(2) {
+                advance()
+            }
+        }
         skipWhiteSpace()
 
         var isClosing = false
@@ -61,11 +79,16 @@ class Parser(var url: String, val body: String, val listTerms: List<String>) {
             isClosing = true
         }
 
-        val name = parseIdentifier()
+        val name = parseIdentifier().lowercase()
 
-        if (name.lowercase() == "body") isCollecting = !isClosing
+        if (name == "script" || name == "style") {
+            parseUntilClosing(name)
+            return
+        }
 
-        if (name.lowercase() == "a") parseAnchor()
+        if (name == "body") isCollecting = !isClosing
+
+        if (name == "a") parseAnchor()
 
         while (!isAtEnd() && body[current] != '>') {
             advance()
@@ -73,9 +96,61 @@ class Parser(var url: String, val body: String, val listTerms: List<String>) {
 
         advance()
 
-        if (name.lowercase() == "doctype") return
+        if (name == "doctype") return
 
         parseTagBody()
+    }
+
+    val quotes = listOf('"', '\'', '`')
+    private fun isQuote(): Boolean {
+        if (isAtEnd()) return false
+
+        return quotes.contains(body[current])
+    }
+
+    private fun parseUntilClosing(tag: String) {
+        while (!isAtEnd() && body[current] != '>') {
+            advance()
+        }
+
+        var matched = false
+        while (!matched && !isAtEnd()) {
+            while (!isAtEnd() && body[current] != '<' && peek(1) != '/' && !isQuote()) {
+                advance()
+            }
+
+            if (isQuote()) {
+                val quoteChar = body[current]
+
+                advance()
+
+                while (!isAtEnd() && body[current] != quoteChar) {
+                    advance()
+                }
+                advance()
+            }
+
+            if (isAtEnd()) break
+
+            if (body[current] == '<' && peek(1) == '/') {
+                repeat(2) {
+                    advance()
+                }
+
+                skipWhiteSpace()
+
+                matched = true
+                for (i in tag.indices) {
+                    if (body[current] != tag[i]) {
+                        matched = false
+                        break
+                    }
+                    advance()
+                }
+
+                advance()
+            }
+        }
     }
 
     private fun parseAnchor() {
@@ -84,14 +159,15 @@ class Parser(var url: String, val body: String, val listTerms: List<String>) {
             val attribute = parseIdentifier()
             if (check('=')) {
                 consume('=')
-                var value = parseValue()
+                var attributeValue = parseValue()
 
-                if (attribute.lowercase() == "href" && value.isNotEmpty()) {
-                    if (value.startsWith('/')) {
-                        value = domain + value
-                        if (isUrl(value)) {
-                            links.add(value)
-                        }
+                if (attribute.lowercase() == "href" && attributeValue.isNotEmpty()) {
+                    if (attributeValue.startsWith('/')) {
+                        attributeValue = domain + attributeValue
+                    }
+
+                    if (isUrl(attributeValue)) {
+                        links.add(attributeValue)
                     }
                 }
             }
@@ -116,11 +192,11 @@ class Parser(var url: String, val body: String, val listTerms: List<String>) {
             advance()
         }
 
-        val meat = body.substring(start, current).trim()
+        val tagContent = body.substring(start, current).trim()
 
-        if (meat.isNotEmpty() && isCollecting) {
+        if (tagContent.isNotEmpty() && isCollecting) {
             listTerms.forEach {
-                if (meat.contains(it)) {
+                if (tagContent.contains(it)) {
                     terms[it] = (terms[it] ?: 0) + 1
                 }
             }
@@ -132,6 +208,12 @@ class Parser(var url: String, val body: String, val listTerms: List<String>) {
         while (Character.isAlphabetic(body[current].code)) advance()
 
         return body.substring(start, current)
+    }
+
+    private fun peek(index: Int): Char {
+        if (current + index > body.length - 1) return Char(0)
+
+        return body[current + index]
     }
 
     private fun check(char: Char): Boolean {
@@ -183,7 +265,7 @@ fun printHelp() {
     println("Usage: crawler url term [term]...")
 }
 
-fun main(args: Array<String>) = runBlocking {
+fun main(args: Array<String>) {
     if (args.size < 2) {
         printHelp()
         exitProcess(1)
@@ -198,22 +280,16 @@ fun main(args: Array<String>) = runBlocking {
 
     val terms = args
         .sliceArray(1 until args.size)
-        .map {
-            if (it[0] == '"' && it[it.length - 1] == '"') {
-                it.substring(1, it.length - 2)
-            } else {
-                it
-            }
-        }
         .toList()
 
-//    val body = FileReader("source.html").readText() // debug way
+    val body = FileReader("source.html").readText() // debug way
 
-    val body = URL(url).readText()
+//    val body = URL(url).readText()
 
     val parser = Parser(url, body, terms)
     parser.parse()
 
-    println(parser.links.toList())
+
+    parser.links.toList()
     println(parser.terms)
 }
