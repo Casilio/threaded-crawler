@@ -3,7 +3,6 @@ import java.io.FileReader
 import java.net.MalformedURLException
 import java.net.URL
 import java.util.*
-import kotlin.collections.HashMap
 import kotlin.system.exitProcess
 
 
@@ -37,59 +36,84 @@ const val MAX_DEPTH = 8
 const val MAX_RESULTS = 100
 
 var terms: List<String>? = null
-val urlsToProcess = Stack<Pair<String, Int>>()
+
+typealias UrlToProcess = Pair<String, Int>
+val urlsToProcess = Stack<UrlToProcess>()
+val bodiesToProcess = Stack<Pair<String, UrlToProcess>>()
 val results = HashMap<String, Result?>()
 
-fun processNextUrl() {
-    if (urlsToProcess.empty()) return
+suspend fun fetch() = coroutineScope {
+    while (synchronized(urlsToProcess) { urlsToProcess.isNotEmpty() }) {
+        launch(Dispatchers.IO) {
+            synchronized(urlsToProcess) {
+                if (urlsToProcess.isEmpty()) return@launch
+            }
 
-    val parentPair = urlsToProcess.pop()
+            val urlToProcess = urlsToProcess.pop()
+            val (url, depth) = urlToProcess
 
-    val uri = URL(parentPair.first)
-    val domain = "${uri.protocol}://${uri.host}"
-    val map = HashMap<String, Int>(terms!!.size)
-
-    val body = if (System.getenv("DEBUG") == "1") {
-        FileReader("source.html").readText()
-    } else {
-        println("Fetching ${parentPair.first}. Depth: ${parentPair.second}")
-        URL(parentPair.first).readText()
-    }
-
-    Parser(body, object: Consumer{
-        override fun onContent(content: String) {
-            terms!!.forEach {
-                // TODO: record actual matches count instead of incrementing once
-                if (content.contains(it)) {
-                    map[it] = (map[it] ?: 0) + 1
+            val body = if (System.getenv("DEBUG") == "1") {
+                withContext(Dispatchers.IO) {
+                    FileReader("source.html").readText()
                 }
-            }
-        }
-
-        override fun onLink(link: String) {
-            var url = link
-            if (link.startsWith('/')) {
-                url = domain + link
+            } else {
+                println("Fetching ${url}. Depth: $depth")
+                URL(url).readText()
             }
 
-            if (parentPair.second + 1 > MAX_DEPTH) return
-            if (results.size - 1 >= MAX_RESULTS) return
-            if (!isUrl(url)) return
-            if (results.containsKey(url)) return
-
-            results[url] = null
-            urlsToProcess.push(Pair(url, parentPair.second + 1))
+            synchronized(bodiesToProcess) {
+                bodiesToProcess.push(Pair(body, urlToProcess))
+            }
         }
-    }).parse()
-
-    results[parentPair.first] = Result(parentPair.first, map, map.values.fold(0) { acc, i -> acc + i })
+    }
 }
 
+suspend fun parse() = coroutineScope {
+    while (synchronized(bodiesToProcess) { bodiesToProcess.isNotEmpty() }) {
+        launch(Dispatchers.IO) {
+            val (body, meta) = bodiesToProcess.pop()
+            val (url, depth) = meta
+
+            val map = HashMap<String, Int>(terms!!.size)
+
+            val uri = URL(url)
+            val domain = "${uri.protocol}://${uri.host}"
+
+            Parser(body, object: Consumer{
+                override fun onContent(content: String) {
+                    terms!!.forEach {
+                        // TODO: record actual matches count instead of incrementing once
+                        if (content.contains(it)) {
+                            map[it] = (map[it] ?: 0) + 1
+                        }
+                    }
+                }
+
+                override fun onLink(link: String) {
+                    var nextUrl = link
+                    if (link.startsWith('/')) {
+                        nextUrl = domain + link
+                    }
+
+                    if (depth + 1 > MAX_DEPTH) return
+                    if (results.size - 1 >= MAX_RESULTS) return
+                    if (!isUrl(nextUrl)) return
+                    if (results.containsKey(nextUrl)) return
+
+                    results[nextUrl] = null
+                    urlsToProcess.push(Pair(nextUrl, depth + 1))
+                }
+            }).parse()
+
+            results[url] = Result(url, map, map.values.fold(0) { acc, i -> acc + i })
+        }
+    }
+}
 fun printHelp() {
     println("Usage: crawler url term [term]...")
 }
 
-fun main(args: Array<String>) {
+fun main(args: Array<String>) = runBlocking {
     if (args.size < 2) {
         printHelp()
         exitProcess(1)
@@ -108,14 +132,15 @@ fun main(args: Array<String>) {
 
     urlsToProcess.push(Pair(url, 1))
 
-    while (urlsToProcess.isNotEmpty()) {
-        processNextUrl()
+    while (urlsToProcess.isNotEmpty() || bodiesToProcess.isNotEmpty()) {
+        fetch()
+        parse()
     }
 
     println(results.size)
-    for (i in results) {
-        println(i.key)
-        println(i.value!!.totalMatches)
-        println(i.value!!.map)
+    for ((k,v) in results) {
+        println(k)
+        println(v!!.totalMatches)
+        println(v.map)
     }
 }
