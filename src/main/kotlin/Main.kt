@@ -38,18 +38,22 @@ const val MAX_RESULTS = 100
 var terms: List<String>? = null
 
 typealias UrlToProcess = Pair<String, Int>
-val urlsToProcess = Stack<UrlToProcess>()
-val bodiesToProcess = Stack<Pair<String, UrlToProcess>>()
+var urlsToProcess = Stack<UrlToProcess>()
+var bodiesToProcess = Stack<Pair<String, UrlToProcess>>()
 val results = HashMap<String, Result?>()
 
 suspend fun fetch() = coroutineScope {
-    while (synchronized(urlsToProcess) { urlsToProcess.isNotEmpty() }) {
-        launch(Dispatchers.IO) {
-            synchronized(urlsToProcess) {
-                if (urlsToProcess.isEmpty()) return@launch
-            }
+    var temp: Stack<UrlToProcess>
+    synchronized(urlsToProcess) {
+        temp = urlsToProcess.clone() as Stack<UrlToProcess>
+        urlsToProcess.clear()
+    }
+    if (temp.isEmpty()) return@coroutineScope
+    var dispatcher = Dispatchers.IO.limitedParallelism(temp.size)
 
-            val urlToProcess = urlsToProcess.pop()
+    (0 until temp.size).map {
+        async (dispatcher) {
+            val urlToProcess = temp[it]
             val (url, depth) = urlToProcess
 
             val body = if (System.getenv("DEBUG") == "1") {
@@ -60,18 +64,31 @@ suspend fun fetch() = coroutineScope {
                 println("Fetching ${url}. Depth: $depth")
                 URL(url).readText()
             }
+            Pair(body, urlToProcess)
+        }
 
-            synchronized(bodiesToProcess) {
-                bodiesToProcess.push(Pair(body, urlToProcess))
-            }
+    }.map {
+        it.await()
+    }.forEach {
+        synchronized(bodiesToProcess) {
+            bodiesToProcess.push(it)
         }
     }
 }
 
 suspend fun parse() = coroutineScope {
-    while (synchronized(bodiesToProcess) { bodiesToProcess.isNotEmpty() }) {
-        launch(Dispatchers.IO) {
-            val (body, meta) = bodiesToProcess.pop()
+    var temp: Stack<Pair<String, UrlToProcess>>
+    synchronized(bodiesToProcess) {
+        temp = bodiesToProcess.clone() as Stack<Pair<String, UrlToProcess>>
+        bodiesToProcess.clear()
+    }
+
+    if (temp.isEmpty()) return@coroutineScope
+    var dispatcher = Dispatchers.IO.limitedParallelism(temp.size)
+
+    (0 until temp.size).map {
+        async(dispatcher) {
+            val (body, meta) = temp[it]
             val (url, depth) = meta
 
             val map = HashMap<String, Int>(terms!!.size)
@@ -79,7 +96,9 @@ suspend fun parse() = coroutineScope {
             val uri = URL(url)
             val domain = "${uri.protocol}://${uri.host}"
 
-            Parser(body, object: Consumer{
+            println("Parsing from $url")
+
+            Parser(body, object : Consumer {
                 override fun onContent(content: String) {
                     terms!!.forEach {
                         // TODO: record actual matches count instead of incrementing once
@@ -91,17 +110,24 @@ suspend fun parse() = coroutineScope {
 
                 override fun onLink(link: String) {
                     var nextUrl = link
-                    if (link.startsWith('/')) {
+                    if (link.startsWith("//")) {
+                        nextUrl = uri.protocol + link
+                    } else if (link.startsWith('/')) {
                         nextUrl = domain + link
                     }
 
-                    if (depth + 1 > MAX_DEPTH) return
-                    if (results.size - 1 >= MAX_RESULTS) return
-                    if (!isUrl(nextUrl)) return
-                    if (results.containsKey(nextUrl)) return
+                    synchronized(results) {
+                        if (depth + 1 > MAX_DEPTH) return
+                        if (results.size - 1 >= MAX_RESULTS) return
+                        if (!isUrl(nextUrl)) return
+                        if (results.containsKey(nextUrl)) return
 
-                    results[nextUrl] = null
-                    urlsToProcess.push(Pair(nextUrl, depth + 1))
+                        results[nextUrl] = null
+                    }
+
+                    synchronized(urlsToProcess) {
+                        urlsToProcess.push(Pair(nextUrl, depth + 1))
+                    }
                 }
             }).parse()
 
@@ -132,10 +158,20 @@ fun main(args: Array<String>) = runBlocking {
 
     urlsToProcess.push(Pair(url, 1))
 
+    val start = System.currentTimeMillis()
+
     while (urlsToProcess.isNotEmpty() || bodiesToProcess.isNotEmpty()) {
-        fetch()
-        parse()
+        coroutineScope {
+            launch {
+                fetch()
+            }
+            launch {
+                parse()
+            }
+        }
     }
+
+    println(System.currentTimeMillis() - start)
 
     println(results.size)
     for ((k,v) in results) {
